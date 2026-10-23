@@ -7,7 +7,7 @@ use std::io;
 use std::mem::size_of;
 use std::os::windows::ffi::OsStrExt;
 use std::os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, OwnedHandle, RawHandle};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf, Prefix};
 use std::ptr::{null, null_mut};
 
 use windows_sys::Win32::Foundation::{
@@ -180,6 +180,61 @@ impl<'a> Launch<'a> {
             .changes
             .push((name.as_ref().to_owned(), None));
         self
+    }
+
+    /// Adds the per-drive current-directory entry needed when supplying a
+    /// custom environment block to `CreateProcess`.
+    ///
+    /// Windows stores each drive's current directory in a special environment
+    /// entry such as `=C:=C:\work`. The drive must be an ASCII letter and the
+    /// path must be an absolute path on that drive. This dedicated API keeps
+    /// the special entry separate from [`env`](Self::env), whose names cannot
+    /// contain `=`.
+    pub fn env_drive_current_dir(
+        &mut self,
+        drive: char,
+        directory: impl AsRef<Path>,
+    ) -> io::Result<&mut Self> {
+        let drive = u8::try_from(drive as u32)
+            .ok()
+            .filter(u8::is_ascii_alphabetic);
+        let Some(drive) = drive else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "drive current-directory entries require an ASCII drive letter",
+            ));
+        };
+        let directory = directory.as_ref();
+        let path_drive = match directory.components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(path_drive) | Prefix::VerbatimDisk(path_drive) => Some(path_drive),
+                _ => None,
+            },
+            _ => None,
+        };
+        if !directory.is_absolute()
+            || path_drive.map(|path_drive| path_drive.to_ascii_uppercase())
+                != Some(drive.to_ascii_uppercase())
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "drive current-directory path must be absolute and match its drive letter",
+            ));
+        }
+        let value: Vec<u16> = directory.as_os_str().encode_wide().collect();
+        if value.contains(&0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "drive current-directory path must not contain NUL",
+            ));
+        }
+        self.environment
+            .drive_current_directories
+            .retain(|(existing, _)| !existing.eq_ignore_ascii_case(&drive));
+        self.environment
+            .drive_current_directories
+            .push((drive.to_ascii_uppercase(), directory.as_os_str().to_owned()));
+        Ok(self)
     }
 
     /// Starts the child's environment empty instead of from this process's.
@@ -657,12 +712,14 @@ struct EnvironmentPlan {
     clear: bool,
     /// In call order; `None` removes the variable.
     changes: Vec<(OsString, Option<OsString>)>,
+    /// Per-drive working directories have reserved names beginning with `=`.
+    drive_current_directories: Vec<(u8, OsString)>,
 }
 
 impl EnvironmentPlan {
     /// The Unicode environment block, or `None` to inherit this process's.
     fn block(&self) -> io::Result<Option<Vec<u16>>> {
-        if !self.clear && self.changes.is_empty() {
+        if !self.clear && self.changes.is_empty() && self.drive_current_directories.is_empty() {
             return Ok(None);
         }
         let mut entries: Vec<(Vec<u16>, Vec<u16>)> = Vec::new();
@@ -674,6 +731,13 @@ impl EnvironmentPlan {
                     value.encode_wide().collect(),
                 );
             }
+        }
+        for (drive, directory) in &self.drive_current_directories {
+            let mut name = vec![u16::from(b'=')];
+            name.push(u16::from(*drive));
+            name.push(u16::from(b':'));
+            let value: Vec<u16> = directory.encode_wide().collect();
+            upsert(&mut entries, name, value);
         }
         for (name, value) in &self.changes {
             let name: Vec<u16> = name.encode_wide().collect();
@@ -820,7 +884,7 @@ fn append_argument(line: &mut Vec<u16>, argument: &OsStr) -> io::Result<()> {
 mod tests {
     use std::ffi::OsString;
     use std::os::windows::ffi::OsStringExt;
-    use std::path::Path;
+    use std::path::{Component, Path, Prefix};
     use std::time::Duration;
 
     use super::{anonymous_pipe, command_line, command_line_tail, read_to_end_bounded, Launch};
@@ -836,6 +900,74 @@ mod tests {
         let arguments: Vec<OsString> = arguments.iter().map(OsString::from).collect();
         let units = command_line(Path::new(r"C:\a b\x.exe"), &arguments).unwrap();
         String::from_utf16(&units[..units.len() - 1]).unwrap()
+    }
+
+    #[test]
+    fn cleared_environment_can_include_a_validated_drive_current_directory() {
+        let mut launch = Launch::new(cmd());
+        launch.env_clear();
+        launch
+            .env_drive_current_dir('c', Path::new(r"C:\work dir"))
+            .unwrap()
+            .env("SystemRoot", r"C:\Windows");
+
+        let block = launch.environment.block().unwrap().unwrap();
+        assert_eq!(
+            String::from_utf16(&block).unwrap(),
+            "=C:=C:\\work dir\0SystemRoot=C:\\Windows\0\0"
+        );
+    }
+
+    #[test]
+    fn drive_current_directory_rejects_mismatched_or_non_drive_paths() {
+        let mut launch = Launch::new(cmd());
+        assert!(launch
+            .env_drive_current_dir('D', Path::new(r"C:\work"))
+            .is_err());
+        assert!(launch
+            .env_drive_current_dir('=', Path::new(r"C:\work"))
+            .is_err());
+        assert!(launch
+            .env_drive_current_dir('C', Path::new(r"relative\work"))
+            .is_err());
+    }
+
+    #[test]
+    fn ordinary_environment_api_rejects_arbitrary_equal_sign_names() {
+        let mut launch = Launch::new(cmd());
+        launch.env_clear().env("=C:", r"C:\work");
+        assert_eq!(
+            launch.environment.block().unwrap_err().kind(),
+            std::io::ErrorKind::InvalidInput
+        );
+    }
+
+    #[test]
+    fn a_cleared_environment_can_launch_with_a_drive_current_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let drive = match directory.path().components().next() {
+            Some(Component::Prefix(prefix)) => match prefix.kind() {
+                Prefix::Disk(drive) | Prefix::VerbatimDisk(drive) => char::from(drive),
+                _ => panic!("temporary directory is not on a drive"),
+            },
+            _ => panic!("temporary directory is not on a drive"),
+        };
+        let system_root = std::env::var_os("SystemRoot").expect("SystemRoot is set");
+        let (read, write) = anonymous_pipe().unwrap();
+        let child = Launch::new(cmd())
+            .args(["/d", "/c", "echo launch-ok"])
+            .current_dir(directory.path())
+            .env_clear()
+            .env_drive_current_dir(drive, directory.path())
+            .unwrap()
+            .env("SystemRoot", system_root)
+            .stdout(&write)
+            .spawn()
+            .unwrap();
+        drop(write);
+        let output = read_to_end_bounded(&read, 4096).unwrap();
+        child.wait(Some(Duration::from_secs(30))).unwrap();
+        assert_eq!(String::from_utf8_lossy(&output).trim(), "launch-ok");
     }
 
     #[test]
